@@ -28,9 +28,10 @@ This MVP demonstrates:
 - ✅ Scalable system design (documented for production)
 
 **Tech Stack:**
-- **Backend:** Node.js, Express, CORS
-- **Frontend:** React (Vite), JavaScript
-- **Storage:** In-memory (arrays) - simulates database
+- **Backend:** Node.js, Express, Prisma ORM, Multer
+- **Frontend:** React (Vite), Socket.IO Client
+- **Database:** MySQL / PostgreSQL
+- **Storage:** Local file system (Dev) / S3 (Prod ready)
 
 ---
 
@@ -50,589 +51,114 @@ Research teams struggle to:
 
 ---
 
-## 🏗️ System Architecture
+## 🏗️ System Architecture (v2.0 Upgrade)
 
-### High-Level Architecture
+### Enhanced Production Architecture
 
 ```mermaid
 graph TB
     subgraph "Client Layer"
-        A[React Frontend<br/>Vite Dev Server<br/>Port 5173]
+        A[React Frontend<br/>Vite + Socket.io Client]
+    end
+    
+    subgraph "Cloud & Middleware"
+        G[Cloudinary<br/>Media Assets]
+        H[Redis<br/>Caching Layer]
+        I[Express Rate Limit<br/>Throttling]
     end
     
     subgraph "API Layer"
-        B[Express REST API<br/>Port 3000]
+        B[Express REST API<br/>JWT Auth + RBAC]
     end
     
-    subgraph "Data Layer - MVP"
-        C[In-Memory Storage<br/>Arrays]
+    subgraph "Data Layer"
+        D[PostgreSQL<br/>Prisma ORM]
     end
     
-    subgraph "Data Layer - Production"
-        D[PostgreSQL<br/>Primary Database]
-        E[Redis<br/>Cache Layer]
-        F[AWS S3<br/>File Storage]
-    end
-    
-    A -->|HTTP/JSON| B
-    B -->|CRUD Operations| C
-    B -.->|Would Use| D
-    B -.->|Would Use| E
-    B -.->|Would Use| F
-    
-    style C fill:#667eea,stroke:#333,stroke-width:2px,color:#fff
-    style D fill:#4a5568,stroke:#333,stroke-width:1px,color:#fff
-    style E fill:#4a5568,stroke:#333,stroke-width:1px,color:#fff
-    style F fill:#4a5568,stroke:#333,stroke-width:1px,color:#fff
+    A <-->|WebSockets| B
+    A -->|Authenticated REST| B
+    B -->|Schema Validation| D
+    B <-->|Cache Check| H
+    B -->|Upload & Sign| G
+    B -->|Verify Auth| I
 ```
 
-### Component Breakdown
+### Key v2.0 Features (Case Study Requirements)
 
-#### Frontend (React + Vite)
-- **Purpose:** User interface for vault and source management
-- **Key Features:**
-  - Vault creation and selection
-  - Source addition and display
-  - Role-based UI rendering
-  - Polling for simulated real-time updates (every 3 seconds)
-- **Production Enhancements:**
-  - WebSocket connection for real-time updates
-  - JWT authentication
-  - Optimistic UI updates
-  - Offline support with service workers
+#### 🛡️ 1. Security & Protection
+- **Rate Limiting:** Implemented `express-rate-limit` on all critical endpoints (Auth, Vault writes) to prevent brute-force and DoS attacks.
+- **Throttling:** API requests are capped per IP to ensure system stability.
+- **RBAC Enforcement:** Stricter role-based access checks on the backend for all source modifications.
 
-#### Backend (Express)
-- **Purpose:** REST API for data operations
-- **Endpoints:**
-  - `GET /` - Health check
-  - `GET /vaults` - List all vaults
-  - `POST /vaults` - Create new vault
-  - `GET /vaults/:id/sources` - Get vault sources
-  - `POST /vaults/:id/sources` - Add source to vault
-- **Production Enhancements:**
-  - JWT authentication middleware
-  - RBAC permission checks
-  - Input validation and sanitization
-  - Rate limiting
-  - Error handling and logging
+#### ☁️ 2. Cloud Storage Integration
+- **Cloudinary:** Fully integrated for reliable file and image hosting.
+- **Secure Uploads:** Files are processed via Multer and streamed to Cloudinary's global CDN.
+- **Dynamic Previews:** Automatic image optimization and secure download links.
 
-#### Data Storage (In-Memory → PostgreSQL)
-- **MVP:** JavaScript arrays in memory
-- **Production:** PostgreSQL with proper schema, indexes, and constraints
+#### ⚡ 3. Performance & Caching
+- **Redis Integration:** Implemented caching for high-frequency READ operations (Vault list, Source list).
+- **Cache Invalidation:** Smart eviction logic—caches are purged only when relevant data is updated (e.g., adding a source clears the vault's source cache).
+
+#### 🔔 4. Real-Time Collaboration
+- **Socket.IO:** Multi-room WebSocket architecture allows researchers to see updates instantly.
+- **Live Notifications:** System-wide notifications when added to a vault or when team members perform key actions.
+- **Toast UI:** Modern non-intrusive notification system.
+
+#### 🎨 5. Creative Edge: Auto-Citation
+- **APA 7th Gen Generator:** Built-in tool to instantly generate research citations for any source.
+- **One-Click Copy:** Simplified flow for researchers to cite their findings in papers.
 
 ---
 
 ## 💾 Data Model
 
-### Current (In-Memory)
+### Production Schema (v2.0)
 
-```javascript
-// Vault
-{
-  id: number,
-  name: string,
-  role: 'OWNER' | 'CONTRIBUTOR' | 'VIEWER',
-  createdAt: ISO timestamp
+SyncScript uses a robust relational schema managed by **Prisma** for PostgreSQL.
+
+```prisma
+// Vault Model with RBAC
+model Vault {
+  id        Int           @id @default(autoincrement())
+  name      String
+  members   VaultMember[]
+  sources   Source[]
+  logs      AuditLog[]
+  createdAt DateTime      @default(now())
 }
 
-// Source
-{
-  id: number,
-  vaultId: number,
-  title: string,
-  url: string,
-  addedAt: ISO timestamp
+// Multi-Role Membership
+model VaultMember {
+  id      Int      @id @default(autoincrement())
+  vaultId Int
+  userId  Int
+  role    Role     @default(VIEWER) // OWNER, CONTRIBUTOR, VIEWER
+  user    User     @relation(fields: [userId], references: [id])
+  vault   Vault    @relation(fields: [vaultId], references: [id])
+}
+
+// Enhanced Source Model
+model Source {
+  id        Int      @id @default(autoincrement())
+  type      String   // url, file, note, image, media
+  title     String
+  content   String?  @db.Text // URL or Note content
+  fileUrl   String?  @db.Text // Cloudinary Asset URL
+  addedBy   String
+  vaultId   Int
 }
 ```
 
-### Production (PostgreSQL Schema)
-
-```sql
--- Users Table
-CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  name VARCHAR(255) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-CREATE INDEX idx_users_email ON users(email);
-
--- Vaults Table
-CREATE TABLE vaults (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-CREATE INDEX idx_vaults_owner ON vaults(owner_id);
-
--- Vault Members (RBAC)
-CREATE TABLE vault_members (
-  id SERIAL PRIMARY KEY,
-  vault_id INTEGER REFERENCES vaults(id) ON DELETE CASCADE,
-  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-  role VARCHAR(50) NOT NULL CHECK (role IN ('OWNER', 'CONTRIBUTOR', 'VIEWER')),
-  joined_at TIMESTAMP DEFAULT NOW(),
-  UNIQUE(vault_id, user_id)
-);
-CREATE INDEX idx_vault_members_vault ON vault_members(vault_id);
-CREATE INDEX idx_vault_members_user ON vault_members(user_id);
-
--- Sources Table
-CREATE TABLE sources (
-  id SERIAL PRIMARY KEY,
-  vault_id INTEGER REFERENCES vaults(id) ON DELETE CASCADE,
-  title VARCHAR(500) NOT NULL,
-  url TEXT NOT NULL,
-  file_url TEXT, -- S3 URL for uploaded PDFs
-  added_by INTEGER REFERENCES users(id),
-  added_at TIMESTAMP DEFAULT NOW()
-);
-CREATE INDEX idx_sources_vault ON sources(vault_id);
-CREATE INDEX idx_sources_added_by ON sources(added_by);
-
--- Activity Log (Audit Trail)
-CREATE TABLE activity_log (
-  id SERIAL PRIMARY KEY,
-  vault_id INTEGER REFERENCES vaults(id) ON DELETE CASCADE,
-  user_id INTEGER REFERENCES users(id),
-  action VARCHAR(100) NOT NULL,
-  resource_type VARCHAR(50),
-  resource_id INTEGER,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-CREATE INDEX idx_activity_vault ON activity_log(vault_id);
-CREATE INDEX idx_activity_user ON activity_log(user_id);
-```
-
-### Entity Relationships
-
-```mermaid
-erDiagram
-    USERS ||--o{ VAULTS : owns
-    USERS ||--o{ VAULT_MEMBERS : "is member of"
-    VAULTS ||--o{ VAULT_MEMBERS : "has members"
-    VAULTS ||--o{ SOURCES : contains
-    USERS ||--o{ SOURCES : adds
-    VAULTS ||--o{ ACTIVITY_LOG : "has activity"
-    USERS ||--o{ ACTIVITY_LOG : performs
-
-    USERS {
-        int id PK
-        string email UK
-        string name
-        string password_hash
-        timestamp created_at
-    }
-    
-    VAULTS {
-        int id PK
-        string name
-        int owner_id FK
-        timestamp created_at
-    }
-    
-    VAULT_MEMBERS {
-        int id PK
-        int vault_id FK
-        int user_id FK
-        string role
-        timestamp joined_at
-    }
-    
-    SOURCES {
-        int id PK
-        int vault_id FK
-        string title
-        string url
-        string file_url
-        int added_by FK
-        timestamp added_at
-    }
-    
-    ACTIVITY_LOG {
-        int id PK
-        int vault_id FK
-        int user_id FK
-        string action
-        string resource_type
-        int resource_id
-        timestamp created_at
-    }
-```
-
 ---
 
-## 🔐 Role-Based Access Control (RBAC)
+## ⚖️ Trade-offs & Design Decisions
 
-### Role Hierarchy
-
-| Role | Permissions |
-|------|-------------|
-| **OWNER** | Full control: add/remove members, add/edit/delete sources, delete vault |
-| **CONTRIBUTOR** | Add and edit sources, view all sources |
-| **VIEWER** | Read-only access to all sources |
-
-### Implementation Strategy
-
-#### MVP (Simulated)
-- All vaults hardcoded with `role: 'OWNER'`
-- UI conditionally renders buttons based on role
-- No actual permission enforcement on backend
-
-#### Production (Full RBAC)
-
-**Authentication Middleware:**
-```javascript
-// Verify JWT token and attach user to request
-const authenticateUser = (req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { id, email, name }
-    next();
-  } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-};
-```
-
-**Authorization Middleware:**
-```javascript
-// Check if user has required role for vault
-const requireVaultRole = (allowedRoles) => async (req, res, next) => {
-  const vaultId = req.params.id;
-  const userId = req.user.id;
-  
-  const membership = await db.query(
-    'SELECT role FROM vault_members WHERE vault_id = $1 AND user_id = $2',
-    [vaultId, userId]
-  );
-  
-  if (!membership.rows.length) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  
-  if (!allowedRoles.includes(membership.rows[0].role)) {
-    return res.status(403).json({ error: 'Insufficient permissions' });
-  }
-  
-  req.userRole = membership.rows[0].role;
-  next();
-};
-```
-
-**Usage Example:**
-```javascript
-// Only OWNER and CONTRIBUTOR can add sources
-app.post('/vaults/:id/sources', 
-  authenticateUser,
-  requireVaultRole(['OWNER', 'CONTRIBUTOR']),
-  addSourceHandler
-);
-```
+1. **Redis vs Memory:** Chose Redis over local cache to allow horizontal scaling of API nodes in production.
+2. **Cloudinary vs S3:** Selected Cloudinary for its superior image transformation capabilities and easier setup for this specific researcher workflow.
+3. **Socket Rooms:** Implemented room-based socket logic instead of global broadcasts to ensure privacy and reduce client overhead.
+4. **Glassmorphism UI:** Prioritized a high-contrast, modern "Dark Mode" aesthetic using backdrop filters to provide a premium feel (Outfit Font).
 
 ---
-
-## 🔄 Real-Time Collaboration Strategy
-
-### MVP Approach: Polling
-
-**How it works:**
-- Frontend polls API every 3 seconds
-- Fetches latest vaults and sources
-- Updates UI if data changed
-
-**Code:**
-```javascript
-useEffect(() => {
-  const pollInterval = setInterval(() => {
-    fetchVaults();
-    if (selectedVault) {
-      fetchSources(selectedVault.id);
-    }
-  }, 3000);
-  
-  return () => clearInterval(pollInterval);
-}, [selectedVault]);
-```
-
-**Pros:**
-- ✅ Simple to implement
-- ✅ Works with standard HTTP
-- ✅ No additional infrastructure
-
-**Cons:**
-- ❌ Inefficient (constant requests even if no changes)
-- ❌ Delayed updates (up to 3 seconds)
-- ❌ Increased server load
-- ❌ Wastes bandwidth
-
----
-
-### Production Approach: WebSockets
-
-**Architecture:**
-
-```mermaid
-sequenceDiagram
-    participant U1 as User 1 Browser
-    participant U2 as User 2 Browser
-    participant WS as WebSocket Server
-    participant API as REST API
-    participant DB as PostgreSQL
-
-    U1->>WS: Connect & Subscribe to Vault #123
-    U2->>WS: Connect & Subscribe to Vault #123
-    
-    U1->>API: POST /vaults/123/sources
-    API->>DB: INSERT source
-    DB-->>API: Success
-    API->>WS: Emit 'SOURCE_ADDED' event
-    WS->>U1: Push update
-    WS->>U2: Push update
-    
-    Note over U1,U2: Both browsers update instantly
-```
-
-**Implementation (Socket.io):**
-
-**Server:**
-```javascript
-const io = require('socket.io')(server, {
-  cors: { origin: 'http://localhost:5173' }
-});
-
-io.on('connection', (socket) => {
-  // User subscribes to vault updates
-  socket.on('subscribe_vault', (vaultId) => {
-    socket.join(`vault_${vaultId}`);
-  });
-  
-  socket.on('unsubscribe_vault', (vaultId) => {
-    socket.leave(`vault_${vaultId}`);
-  });
-});
-
-// After adding a source
-io.to(`vault_${vaultId}`).emit('source_added', newSource);
-```
-
-**Client:**
-```javascript
-import io from 'socket.io-client';
-
-const socket = io('http://localhost:3000');
-
-useEffect(() => {
-  if (selectedVault) {
-    socket.emit('subscribe_vault', selectedVault.id);
-    
-    socket.on('source_added', (source) => {
-      setSources(prev => [...prev, source]);
-    });
-    
-    return () => {
-      socket.emit('unsubscribe_vault', selectedVault.id);
-    };
-  }
-}, [selectedVault]);
-```
-
-**Benefits:**
-- ✅ Instant updates (no delay)
-- ✅ Efficient (only sends when data changes)
-- ✅ Reduced server load
-- ✅ Better user experience
-
----
-
-## 📈 Scalability Plan
-
-### Current Limitations (MVP)
-- In-memory storage → Data lost on restart
-- Single server → No horizontal scaling
-- No caching → Repeated database queries
-- No file storage → Can't upload PDFs
-
-### Production Infrastructure
-
-#### 1. Database Layer (PostgreSQL)
-**Purpose:** Persistent, relational data storage
-
-**Optimizations:**
-- **Indexes:** On foreign keys, frequently queried columns
-- **Connection Pooling:** Reuse database connections (pg-pool)
-- **Read Replicas:** Distribute read queries across multiple databases
-- **Partitioning:** Split large tables by date or vault_id
-
-**Example:**
-```javascript
-const { Pool } = require('pg');
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  max: 20, // Max connections
-  idleTimeoutMillis: 30000,
-});
-```
-
----
-
-#### 2. Caching Layer (Redis)
-**Purpose:** Reduce database load for frequently accessed data
-
-**What to cache:**
-- User vault lists (invalidate on vault creation)
-- Vault source lists (invalidate on source addition)
-- User session data
-
-**Example:**
-```javascript
-const redis = require('redis');
-const client = redis.createClient();
-
-// Get vaults with caching
-app.get('/vaults', async (req, res) => {
-  const userId = req.user.id;
-  const cacheKey = `user:${userId}:vaults`;
-  
-  // Try cache first
-  const cached = await client.get(cacheKey);
-  if (cached) {
-    return res.json({ success: true, data: JSON.parse(cached) });
-  }
-  
-  // Cache miss - query database
-  const vaults = await db.query(
-    'SELECT v.*, vm.role FROM vaults v JOIN vault_members vm ON v.id = vm.vault_id WHERE vm.user_id = $1',
-    [userId]
-  );
-  
-  // Store in cache (expire after 5 minutes)
-  await client.setex(cacheKey, 300, JSON.stringify(vaults.rows));
-  
-  res.json({ success: true, data: vaults.rows });
-});
-```
-
----
-
-#### 3. File Storage (AWS S3 / Cloudinary)
-**Purpose:** Store uploaded PDF files
-
-**Flow:**
-1. User uploads PDF via frontend
-2. Backend receives file, uploads to S3
-3. S3 returns URL
-4. Backend stores URL in database
-5. Frontend displays PDF via S3 URL
-
-**Example (AWS S3):**
-```javascript
-const AWS = require('aws-sdk');
-const s3 = new AWS.S3();
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
-
-app.post('/vaults/:id/sources/upload', upload.single('file'), async (req, res) => {
-  const file = req.file;
-  const vaultId = req.params.id;
-  
-  // Upload to S3
-  const s3Params = {
-    Bucket: process.env.S3_BUCKET,
-    Key: `vaults/${vaultId}/${Date.now()}_${file.originalname}`,
-    Body: file.buffer,
-    ContentType: file.mimetype,
-  };
-  
-  const s3Result = await s3.upload(s3Params).promise();
-  
-  // Save to database
-  const source = await db.query(
-    'INSERT INTO sources (vault_id, title, file_url, added_by) VALUES ($1, $2, $3, $4) RETURNING *',
-    [vaultId, file.originalname, s3Result.Location, req.user.id]
-  );
-  
-  res.json({ success: true, data: source.rows[0] });
-});
-```
-
----
-
-#### 4. Horizontal Scaling
-**Load Balancer:** Distribute traffic across multiple API servers
-
-```
-                    [Load Balancer]
-                    /      |      \
-                   /       |       \
-            [API 1]    [API 2]    [API 3]
-                   \       |       /
-                    \      |      /
-                  [PostgreSQL Primary]
-                  /                \
-        [Read Replica 1]    [Read Replica 2]
-```
-
-**Stateless Design:**
-- No session data stored on API servers
-- JWT tokens for authentication (client-side)
-- Redis for shared session data if needed
-
----
-
-#### 5. CDN (CloudFlare / AWS CloudFront)
-**Purpose:** Serve static assets (React build) from edge locations
-
-**Benefits:**
-- Faster load times globally
-- Reduced server load
-- DDoS protection
-
----
-
-### Scalability Metrics
-
-| Metric | MVP | Production Target |
-|--------|-----|-------------------|
-| **Concurrent Users** | ~10 | 10,000+ |
-| **Request Latency** | ~50ms | <100ms (p99) |
-| **Database Queries/sec** | ~100 | 10,000+ |
-| **File Storage** | None | Unlimited (S3) |
-| **Uptime** | N/A | 99.9% |
-
----
-
-## ⚖️ Trade-offs & Constraints
-
-### What We Built (24-hour constraint)
-✅ Core collaboration flow  
-✅ Clean, demo-ready UI  
-✅ Proper REST API design  
-✅ Comprehensive architecture documentation  
-✅ Simulated RBAC and real-time sync  
-
-### What We Skipped (Production features)
-❌ User authentication (JWT, OAuth)  
-❌ Database persistence (PostgreSQL)  
-❌ File uploads (S3 integration)  
-❌ WebSocket real-time updates  
-❌ Input validation and sanitization  
-❌ Error handling and logging  
-❌ Unit and integration tests  
-❌ Deployment configuration (Docker, CI/CD)  
-
-### Why These Trade-offs Make Sense
-This is a **system design challenge**, not a production app. The goal is to demonstrate:
-1. **Architectural thinking** → Documented in comments and README
-2. **Data modeling** → Proper schema design for production
-3. **Scalability awareness** → Clear path from MVP to production
-4. **Demo-readiness** → Functional, easy to run locally
 
 ---
 
@@ -716,18 +242,18 @@ Open your browser and navigate to: `http://localhost:5173`
    - Enter: "AI Research Papers"
    - Show vault appears with "OWNER" badge
 
-2. **Add Sources**
+2. **Add Sources (Multi-Type)**
    - Select the vault
-   - Add source: "Attention Is All You Need" + URL
-   - Add source: "BERT Paper" + URL
-   - Show sources appear in grid
+   - Add **URL**: "Attention Is All You Need" + Link
+   - Upload **File**: Drag & drop a PDF research paper
+   - Create **Note**: "Key takeaways: Transformers are efficient..."
+   - Show different types appear in grid with badges
 
-3. **Simulated Real-Time Collaboration**
-   - Open second browser tab
-   - Show same vault
+3. **Real-Time Collaboration**
+   - Open second browser tab (incognito)
+   - Login as different user
    - Add source in Tab 1
-   - Wait 3 seconds → Show it appears in Tab 2
-   - Explain: "This uses polling. Production would use WebSockets for instant updates."
+   - Show instant update in Tab 2 (via WebSockets)
 
 ---
 

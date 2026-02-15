@@ -1,0 +1,132 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// USER MODEL
+// ============================================================================
+// Represents registered users in the system
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String   @db.VarChar(255)
+  name      String
+  createdAt DateTime @default(now())
+
+  // Relations
+  ownedVaults   Vault[]        @relation("VaultOwner")
+  vaultMembers  VaultMember[]
+  sources       Source[]       @relation("SourceCreator")
+  auditLogs     AuditLog[]
+
+  @@index([email])
+}
+
+// ============================================================================
+// VAULT MODEL
+// ============================================================================
+// Represents a Knowledge Vault (collaborative workspace)
+model Vault {
+  id        Int      @id @default(autoincrement())
+  name      String
+  ownerId   Int
+  createdAt DateTime @default(now())
+
+  // Relations
+  owner   User          @relation("VaultOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members VaultMember[]
+  sources Source[]
+  auditLogs AuditLog[]
+
+  @@index([ownerId])
+}
+
+// ============================================================================
+// VAULT MEMBER MODEL (RBAC)
+// ============================================================================
+// Many-to-many relationship between Users and Vaults with roles
+// Implements Role-Based Access Control
+model VaultMember {
+  id       Int      @id @default(autoincrement())
+  vaultId  Int
+  userId   Int
+  role     String   @db.VarChar(50)
+  joinedAt DateTime @default(now())
+
+  // Relations
+  vault Vault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([vaultId, userId]) // One role per user per vault
+  @@index([vaultId])
+  @@index([userId])
+}
+
+// ============================================================================
+// SOURCE MODEL (UPGRADED v2.1 - Multi-Type Support)
+// ============================================================================
+// Represents a research source with multiple content types
+// Supported types: url, file, note, media, image
+//
+// PRODUCTION NOTES:
+// - For file/image types, content stores local path (dev) or S3 URL (prod)
+// - Implement file versioning by adding version field
+// - Add metadata JSON field for extensibility (thumbnails, OCR text, etc.)
+// - Consider separate FileMetadata table for advanced file management
+model Source {
+  id       Int      @id @default(autoincrement())
+  vaultId  Int
+  
+  // Multi-type content system (v2.1)
+  type     String   @default("url") @db.VarChar(20)  // 'url', 'file', 'note', 'media', 'image'
+  title    String
+  content  String?  @db.Text                         // URL, file path, or note text (nullable for migration)
+  mimeType String?  @db.VarChar(100)                 // e.g., 'application/pdf', 'image/png'
+  size     Int?                                      // File size in bytes (for files/images)
+  
+  // Legacy fields (kept for backward compatibility)
+  url      String?  @db.Text
+  fileUrl  String?  @db.Text
+  
+  addedBy  Int
+  addedAt  DateTime @default(now())
+
+  // Relations
+  vault   Vault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
+  creator User  @relation("SourceCreator", fields: [addedBy], references: [id])
+
+  @@index([vaultId])
+  @@index([addedBy])
+  @@index([type])  // Index for filtering by type
+}
+
+// ============================================================================
+// AUDIT LOG MODEL
+// ============================================================================
+// Immutable log of all critical actions for accountability
+model AuditLog {
+  id           Int      @id @default(autoincrement())
+  vaultId      Int
+  userId       Int
+  action       String   @db.VarChar(100)
+  resourceType String?  @db.VarChar(50)
+  resourceId   Int?
+  metadata     String?  @db.Text
+  createdAt    DateTime @default(now())
+
+  // Relations
+  vault Vault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id])
+
+  @@index([vaultId])
+  @@index([userId])
+  @@index([createdAt])
+}

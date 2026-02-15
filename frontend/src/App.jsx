@@ -1,27 +1,33 @@
 /**
- * SyncScript Frontend - Main Application Component
+ * SyncScript Frontend v2.0 - Main Application Component
  * 
- * This React app demonstrates:
- * - Collaborative research vault management
- * - Simulated Role-Based Access Control (RBAC)
- * - Simulated real-time collaboration via polling
- * 
- * PRODUCTION NOTES:
- * - Polling would be replaced with WebSocket connections
- * - Authentication would be added (JWT tokens)
- * - State management would use Redux/Zustand for complex apps
+ * UPGRADED FROM MVP:
+ * - JWT authentication (login/register)
+ * - Real-time WebSocket updates (Socket.IO)
+ * - Real RBAC from database
+ * - Audit log viewing (OWNER only)
+ * - Polling kept as fallback
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { io } from 'socket.io-client';
+import Auth from './components/Auth';
 import './App.css';
 
 const API_BASE_URL = 'http://localhost:3000';
 
 function App() {
-    // State management
+    // Authentication state
+    const [user, setUser] = useState(null);
+    const [token, setToken] = useState(null);
+    const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+    // App state
     const [vaults, setVaults] = useState([]);
     const [selectedVault, setSelectedVault] = useState(null);
     const [sources, setSources] = useState([]);
+    const [auditLogs, setAuditLogs] = useState([]);
+    const [showAudit, setShowAudit] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
 
@@ -30,31 +36,219 @@ function App() {
     const [newSourceTitle, setNewSourceTitle] = useState('');
     const [newSourceUrl, setNewSourceUrl] = useState('');
 
+    // Multi-type source states (v2.1)
+    const [sourceType, setSourceType] = useState('url'); // url, file, note, media, image
+    const [sourceFile, setSourceFile] = useState(null);
+    const [noteContent, setNoteContent] = useState('');
+
+    // Case Study: Collaboration & Notifications states
+    const [notifications, setNotifications] = useState([]);
+    const [showMembers, setShowMembers] = useState(false);
+    const [memberEmail, setMemberEmail] = useState('');
+    const [memberRole, setMemberRole] = useState('VIEWER');
+
+    // WebSocket state
+    const [socket, setSocket] = useState(null);
+    const [isConnected, setIsConnected] = useState(false);
+
+    // Ref to track current selected vault (for WebSocket callbacks)
+    const selectedVaultRef = useRef(null);
+
+    // Update ref when selectedVault changes
+    useEffect(() => {
+        selectedVaultRef.current = selectedVault;
+    }, [selectedVault]);
+
     /**
-     * Fetch all vaults from API
-     * PRODUCTION: Would include JWT token in Authorization header
+     * Check for existing auth on mount
+     */
+    useEffect(() => {
+        const storedToken = localStorage.getItem('token');
+        const storedUser = localStorage.getItem('user');
+
+        if (storedToken && storedUser) {
+            setToken(storedToken);
+            setUser(JSON.parse(storedUser));
+            setIsAuthenticated(true);
+        }
+    }, []);
+
+    /**
+     * Setup WebSocket connection when authenticated
+     */
+    useEffect(() => {
+        if (!isAuthenticated || !user) return;
+
+        const newSocket = io(API_BASE_URL);
+
+        newSocket.on('connect', () => {
+            console.log('✅ WebSocket connected');
+            setIsConnected(true);
+            newSocket.emit('join:user', user.id);
+        });
+
+        newSocket.on('disconnect', () => {
+            console.log('❌ WebSocket disconnected');
+            setIsConnected(false);
+        });
+
+        // Listen for vault created event
+        newSocket.on('vault:created', (vault) => {
+            console.log('📦 Vault created:', vault);
+            setVaults(prev => [...prev, vault]);
+        });
+
+        // Listen for source added event
+        newSocket.on('source:added', (source) => {
+            console.log('📄 Source added:', source);
+            // Use ref to get current selectedVault value
+            const currentVault = selectedVaultRef.current;
+            if (currentVault && source.vaultId === currentVault.id) {
+                setSources(prev => {
+                    // Prevent duplicates
+                    const exists = prev.some(s => s.id === source.id);
+                    if (!exists) {
+                        return [...prev, source];
+                    }
+                    return prev;
+                });
+            }
+        });
+
+        // MISSION: Automated Notifications
+        newSocket.on('notification', (notif) => {
+            console.log('🔔 Notification received:', notif);
+            setNotifications(prev => [notif, ...prev]);
+
+            // Auto-hide notification after 5 seconds
+            setTimeout(() => {
+                setNotifications(prev => prev.filter(n => n !== notif));
+            }, 5000);
+
+            // Fetch vaults if we were added to one
+            if (notif.type === 'COLLABORATION') {
+                fetchVaults();
+            }
+        });
+
+        setSocket(newSocket);
+
+        return () => {
+            newSocket.disconnect();
+        };
+    }, [isAuthenticated, user]);
+
+    /**
+     * Join vault room when vault is selected
+     */
+    useEffect(() => {
+        if (socket && selectedVault) {
+            socket.emit('join:vault', selectedVault.id);
+            return () => {
+                socket.emit('leave:vault', selectedVault.id);
+            };
+        }
+    }, [socket, selectedVault]);
+
+    /**
+     * Polling fallback (every 30 seconds if WebSocket disconnected)
+     */
+    useEffect(() => {
+        if (!isAuthenticated || isConnected) return;
+
+        const pollInterval = setInterval(() => {
+            console.log('🔄 Polling (WebSocket disconnected)');
+            fetchVaults();
+            if (selectedVault) {
+                fetchSources(selectedVault.id);
+            }
+        }, 30000);
+
+        return () => clearInterval(pollInterval);
+    }, [isAuthenticated, isConnected, selectedVault]);
+
+    /**
+     * Fetch vaults on auth
+     */
+    useEffect(() => {
+        if (isAuthenticated) {
+            fetchVaults();
+        }
+    }, [isAuthenticated]);
+
+    /**
+     * API Helper with JWT
+     */
+    const apiCall = async (endpoint, options = {}) => {
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+            ...options.headers
+        };
+
+        const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+            ...options,
+            headers
+        });
+
+        if (response.status === 401) {
+            handleLogout();
+            throw new Error('Session expired. Please login again.');
+        }
+
+        const data = await response.json();
+
+        if (data.success === false) {
+            throw new Error(data.error || 'Request failed');
+        }
+
+        return data;
+    };
+
+    /**
+     * Authentication handlers
+     */
+    const handleAuthSuccess = (userData, authToken) => {
+        setUser(userData);
+        setToken(authToken);
+        setIsAuthenticated(true);
+    };
+
+    const handleLogout = () => {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        setUser(null);
+        setToken(null);
+        setIsAuthenticated(false);
+        setVaults([]);
+        setSelectedVault(null);
+        setSources([]);
+        if (socket) {
+            socket.disconnect();
+        }
+    };
+
+    /**
+     * Fetch all vaults
      */
     const fetchVaults = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/vaults`);
-            const data = await response.json();
+            const data = await apiCall('/vaults');
             if (data.success) {
                 setVaults(data.data);
             }
         } catch (err) {
             console.error('Error fetching vaults:', err);
-            setError('Failed to load vaults. Make sure the backend is running on port 3000.');
+            setError(err.message || 'Failed to load vaults');
         }
     };
 
     /**
      * Fetch sources for selected vault
-     * PRODUCTION: Would include JWT token and verify user has access
      */
     const fetchSources = async (vaultId) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/vaults/${vaultId}/sources`);
-            const data = await response.json();
+            const data = await apiCall(`/vaults/${vaultId}/sources`);
             if (data.success) {
                 setSources(data.data);
             }
@@ -65,8 +259,22 @@ function App() {
     };
 
     /**
+     * Fetch audit logs (OWNER only)
+     */
+    const fetchAuditLogs = async (vaultId) => {
+        try {
+            const data = await apiCall(`/vaults/${vaultId}/audit`);
+            if (data.success) {
+                setAuditLogs(data.data);
+            }
+        } catch (err) {
+            console.error('Error fetching audit logs:', err);
+            setError('Failed to load audit logs');
+        }
+    };
+
+    /**
      * Create a new vault
-     * PRODUCTION: Would include JWT token, validate on server
      */
     const createVault = async (e) => {
         e.preventDefault();
@@ -74,22 +282,21 @@ function App() {
 
         setLoading(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/vaults`, {
+            const data = await apiCall('/vaults', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ name: newVaultName }),
+                body: JSON.stringify({ name: newVaultName })
             });
 
-            const data = await response.json();
             if (data.success) {
                 setNewVaultName('');
-                fetchVaults(); // Refresh vault list
+                // WebSocket will handle adding to list
+                if (!isConnected) {
+                    fetchVaults(); // Fallback if WebSocket disconnected
+                }
             }
         } catch (err) {
             console.error('Error creating vault:', err);
-            setError('Failed to create vault');
+            setError(err.message || 'Failed to create vault');
         } finally {
             setLoading(false);
         }
@@ -97,36 +304,117 @@ function App() {
 
     /**
      * Add a source to the selected vault
-     * PRODUCTION: Would verify user has CONTRIBUTOR or OWNER role
+     */
+    /**
+     * Add a source to the selected vault
+     * UPGRADED: Supports multiple types and file uploads
      */
     const addSource = async (e) => {
         e.preventDefault();
-        if (!newSourceTitle.trim() || !newSourceUrl.trim() || !selectedVault) return;
+
+        // Basic validation
+        if (!selectedVault) {
+            setError('Please select a vault first.');
+            return;
+        }
+        if (!newSourceTitle.trim()) {
+            setError('Please provide a title for the source.');
+            return;
+        }
+
+        // Type-specific validation
+        if ((sourceType === 'url' || sourceType === 'media') && !newSourceUrl.trim()) {
+            setError('Please provide a URL.');
+            return;
+        }
+        if ((sourceType === 'file' || sourceType === 'image') && !sourceFile) {
+            setError('Please select a file.');
+            return;
+        }
+        if (sourceType === 'note' && !noteContent.trim()) {
+            setError('Please write something in the note.');
+            return;
+        }
 
         setLoading(true);
+
         try {
+            // Use FormData for file uploads
+            const formData = new FormData();
+            formData.append('title', newSourceTitle);
+            formData.append('type', sourceType);
+
+            if (sourceType === 'url' || sourceType === 'media') {
+                formData.append('content', newSourceUrl);
+            } else if (sourceType === 'file' || sourceType === 'image') {
+                formData.append('file', sourceFile);
+            } else if (sourceType === 'note') {
+                formData.append('content', noteContent);
+            }
+
+            // Custom API call since we can't use JSON for FormData
             const response = await fetch(`${API_BASE_URL}/vaults/${selectedVault.id}/sources`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                    // Content-Type left blank for browser to set boundary
                 },
-                body: JSON.stringify({
-                    title: newSourceTitle,
-                    url: newSourceUrl,
-                }),
+                body: formData
             });
 
+            if (response.status === 401) {
+                handleLogout();
+                throw new Error('Session expired. Please login again.');
+            }
+
             const data = await response.json();
+
             if (data.success) {
+                // Reset form
                 setNewSourceTitle('');
                 setNewSourceUrl('');
-                fetchSources(selectedVault.id); // Refresh sources
+                setSourceFile(null);
+                setNoteContent('');
+                setSourceType('url'); // Reset type to default
+
+                // WebSocket will handle adding to list
+                if (!isConnected) {
+                    fetchSources(selectedVault.id); // Fallback
+                }
+            } else {
+                throw new Error(data.error || 'Failed to add source');
             }
         } catch (err) {
             console.error('Error adding source:', err);
-            setError('Failed to add source');
+            setError(err.message || 'Failed to add source');
         } finally {
             setLoading(false);
+        }
+    };
+
+    /**
+     * Format file size helper
+     */
+    const formatFileSize = (bytes) => {
+        if (!bytes) return '';
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    };
+
+    /**
+     * Get badge for source type
+     */
+    const getTypeBadge = (type) => {
+        switch (type) {
+            case 'url': return '🔗 URL';
+            case 'file': return '📄 File';
+            case 'note': return '📝 Note';
+            case 'media': return '🎥 Media';
+            case 'image': return '🖼️ Image';
+            default: return '🔗 URL';
         }
     };
 
@@ -135,56 +423,126 @@ function App() {
      */
     const handleVaultSelect = (vault) => {
         setSelectedVault(vault);
+        setShowAudit(false);
+        setShowMembers(false);
         fetchSources(vault.id);
     };
 
     /**
-     * Initial data load
+     * Show audit log
      */
-    useEffect(() => {
-        fetchVaults();
-    }, []);
+    const handleShowAudit = () => {
+        if (selectedVault && selectedVault.role === 'OWNER') {
+            setShowAudit(true);
+            setShowMembers(false);
+            fetchAuditLogs(selectedVault.id);
+        }
+    };
 
     /**
-     * SIMULATED REAL-TIME COLLABORATION
-     * Poll for updates every 3 seconds
-     * 
-     * PRODUCTION: This would be replaced with WebSocket connections
-     * - Client connects to WebSocket server on mount
-     * - Server pushes updates when data changes
-     * - Much more efficient than polling
+     * Handle Authenticated Download
      */
-    useEffect(() => {
-        const pollInterval = setInterval(() => {
-            fetchVaults();
-            if (selectedVault) {
-                fetchSources(selectedVault.id);
+    const handleDownload = async (e, source) => {
+        e.preventDefault();
+        try {
+            const response = await fetch(`${API_BASE_URL}/sources/${source.id}/download`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+
+            if (response.status === 401) {
+                handleLogout();
+                throw new Error('Session expired');
             }
-        }, 3000); // Poll every 3 seconds
 
-        return () => clearInterval(pollInterval);
-    }, [selectedVault]);
+            if (!response.ok) {
+                throw new Error('Download failed');
+            }
+
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = source.title;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+        } catch (err) {
+            console.error('Download error:', err);
+            setError('Failed to download file: ' + err.message);
+        }
+    };
 
     /**
-     * Check if user can add sources (simulated RBAC)
-     * PRODUCTION: Role would come from JWT token and VaultMembers table
+     * MISSION: Member Management
      */
+    const addMember = async (e) => {
+        e.preventDefault();
+        if (!selectedVault || !memberEmail.trim()) return;
+
+        setLoading(true);
+        try {
+            const data = await apiCall(`/vaults/${selectedVault.id}/members`, {
+                method: 'POST',
+                body: JSON.stringify({ email: memberEmail, role: memberRole })
+            });
+
+            if (data.success) {
+                setMemberEmail('');
+                setError(null);
+                alert(`Success: ${data.message}`);
+            } else {
+                throw new Error(data.error || 'Failed to add member');
+            }
+        } catch (err) {
+            console.error('Add member error:', err);
+            setError(err.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    /**
+     * MISSION: Auto-Citation Generator
+     */
+    const generateCitation = (source) => {
+        const author = source.addedBy || "Unknown Author";
+        const date = new Date(source.addedAt).getFullYear();
+        const title = source.title;
+        const url = source.content || source.url;
+        const citation = `${author}. (${date}). ${title}.${url ? ` Retrieved from ${url}` : ''}`;
+
+        navigator.clipboard.writeText(citation);
+        alert(`Citation Copied (APA 7th Gen):\n${citation}`);
+    };
+
     const canAddSources = () => {
         if (!selectedVault) return false;
-        // In this MVP, all vaults have OWNER role
-        // In production: return ['OWNER', 'CONTRIBUTOR'].includes(selectedVault.role);
         return selectedVault.role === 'OWNER' || selectedVault.role === 'CONTRIBUTOR';
     };
 
+    if (!isAuthenticated) {
+        return <Auth onAuthSuccess={handleAuthSuccess} />;
+    }
+
     return (
         <div className="app">
-            {/* Header */}
             <header className="header">
-                <h1>🔬 SyncScript</h1>
-                <p className="subtitle">Collaborative Research Platform</p>
+                <div>
+                    <h1>🔬 SyncScript v2.0</h1>
+                    <p className="subtitle">Collaborative Research Platform</p>
+                </div>
+                <div className="header-actions">
+                    <span className="user-badge">👤 {user?.name}</span>
+                    <span className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+                        {isConnected ? '🟢 Live' : '🔴 Offline'}
+                    </span>
+                    <button onClick={handleLogout} className="logout-btn">Logout</button>
+                </div>
             </header>
 
-            {/* Error Display */}
             {error && (
                 <div className="error-banner">
                     {error}
@@ -192,15 +550,21 @@ function App() {
                 </div>
             )}
 
-            {/* Main Content */}
+            <div className="notifications-container">
+                {notifications.map((n, i) => (
+                    <div key={i} className="notification-toast">
+                        <span className="notif-icon">🔔</span>
+                        <p>{n.message}</p>
+                    </div>
+                ))}
+            </div>
+
             <div className="main-content">
-                {/* Sidebar - Vault List */}
                 <aside className="sidebar">
                     <div className="sidebar-header">
                         <h2>Knowledge Vaults</h2>
                     </div>
 
-                    {/* Create Vault Form */}
                     <form onSubmit={createVault} className="create-vault-form">
                         <input
                             type="text"
@@ -209,120 +573,162 @@ function App() {
                             onChange={(e) => setNewVaultName(e.target.value)}
                             disabled={loading}
                         />
-                        <button type="submit" disabled={loading || !newVaultName.trim()}>
-                            + Create
-                        </button>
+                        <button type="submit" disabled={loading || !newVaultName.trim()}>+ Create</button>
                     </form>
 
-                    {/* Vault List */}
                     <div className="vault-list">
                         {vaults.length === 0 ? (
-                            <p className="empty-state">No vaults yet. Create one to get started!</p>
+                            <p className="empty-state">No vaults yet.</p>
                         ) : (
-                            vaults.map((vault) => (
+                            vaults.map((v) => (
                                 <div
-                                    key={vault.id}
-                                    className={`vault-item ${selectedVault?.id === vault.id ? 'active' : ''}`}
-                                    onClick={() => handleVaultSelect(vault)}
+                                    key={v.id}
+                                    className={`vault-item ${selectedVault?.id === v.id ? 'active' : ''}`}
+                                    onClick={() => handleVaultSelect(v)}
                                 >
-                                    <div className="vault-name">{vault.name}</div>
-                                    <div className="vault-role">{vault.role}</div>
+                                    <div className="vault-name">{v.name}</div>
+                                    <div className="vault-role">{v.role}</div>
                                 </div>
                             ))
                         )}
                     </div>
                 </aside>
 
-                {/* Main Area - Sources */}
                 <main className="content-area">
                     {selectedVault ? (
                         <>
                             <div className="content-header">
-                                <h2>{selectedVault.name}</h2>
-                                <span className="role-badge">{selectedVault.role}</span>
+                                <div>
+                                    <h2>{selectedVault.name}</h2>
+                                    <span className="role-badge">{selectedVault.role}</span>
+                                </div>
+                                <div className="content-tabs">
+                                    <button className={!showAudit && !showMembers ? 'active' : ''} onClick={() => { setShowAudit(false); setShowMembers(false); }}>Sources</button>
+                                    {selectedVault.role === 'OWNER' && (
+                                        <>
+                                            <button className={showMembers ? 'active' : ''} onClick={() => { setShowAudit(false); setShowMembers(true); }}>Participants</button>
+                                            <button className={showAudit ? 'active' : ''} onClick={handleShowAudit}>Audit Log</button>
+                                        </>
+                                    )}
+                                </div>
                             </div>
 
-                            {/* Add Source Form - Only show if user has permission */}
-                            {canAddSources() && (
-                                <form onSubmit={addSource} className="add-source-form">
-                                    <div className="form-row">
+                            {showMembers ? (
+                                <div className="members-section" style={{ padding: '2rem' }}>
+                                    <h3>Vault Participants</h3>
+                                    <form onSubmit={addMember} className="add-member-form" style={{ display: 'flex', gap: '1rem', marginBottom: '2rem' }}>
                                         <input
-                                            type="text"
-                                            placeholder="Source title..."
-                                            value={newSourceTitle}
-                                            onChange={(e) => setNewSourceTitle(e.target.value)}
-                                            disabled={loading}
+                                            type="email"
+                                            placeholder="researcher@email.com"
+                                            value={memberEmail}
+                                            onChange={(e) => setMemberEmail(e.target.value)}
+                                            required
+                                            style={{ flex: 1, padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'white' }}
                                         />
-                                        <input
-                                            type="text"
-                                            placeholder="https://example.com/research-paper.pdf"
-                                            value={newSourceUrl}
-                                            onChange={(e) => setNewSourceUrl(e.target.value)}
-                                            disabled={loading}
-                                        />
-                                        <button
-                                            type="submit"
-                                            disabled={loading || !newSourceTitle.trim() || !newSourceUrl.trim()}
+                                        <select
+                                            value={memberRole}
+                                            onChange={(e) => setMemberRole(e.target.value)}
+                                            style={{ padding: '0.75rem', borderRadius: '8px', border: '1px solid var(--border-color)', background: 'var(--bg-dark)', color: 'white' }}
                                         >
-                                            + Add Source
-                                        </button>
-                                    </div>
-                                </form>
-                            )}
-
-                            {/* Sources List */}
-                            <div className="sources-section">
-                                <h3>Research Sources ({sources.length})</h3>
-                                {sources.length === 0 ? (
-                                    <p className="empty-state">
-                                        No sources yet. {canAddSources() ? 'Add your first research source above!' : ''}
-                                    </p>
-                                ) : (
-                                    <div className="sources-grid">
-                                        {sources.map((source) => (
-                                            <div key={source.id} className="source-card">
-                                                <h4>{source.title}</h4>
-                                                <a href={source.url} target="_blank" rel="noopener noreferrer">
-                                                    {source.url}
-                                                </a>
-                                                <div className="source-meta">
-                                                    Added {new Date(source.addedAt).toLocaleDateString()}
+                                            <option value="VIEWER">Viewer</option>
+                                            <option value="CONTRIBUTOR">Contributor</option>
+                                        </select>
+                                        <button type="submit" disabled={loading} className="add-btn">+ Add</button>
+                                    </form>
+                                    <p className="subtitle">Invite collaborators to this research vault.</p>
+                                </div>
+                            ) : showAudit ? (
+                                <div className="audit-section">
+                                    <h3>Audit Log</h3>
+                                    {auditLogs.length === 0 ? (
+                                        <p className="empty-state">No activities recorded yet.</p>
+                                    ) : (
+                                        <div className="audit-list">
+                                            {auditLogs.map((log) => (
+                                                <div key={log.id} className="audit-item">
+                                                    <div className="audit-action">{log.action}</div>
+                                                    <div className="audit-details">{log.user} • {new Date(log.createdAt).toLocaleString()}</div>
                                                 </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ) : (
+                                <>
+                                    {canAddSources() && (
+                                        <form onSubmit={addSource} className="add-source-form">
+                                            <div className="source-type-selector">
+                                                <button type="button" onClick={() => setSourceType('url')} className={sourceType === 'url' ? 'active' : ''}>🔗 URL</button>
+                                                <button type="button" onClick={() => setSourceType('file')} className={sourceType === 'file' ? 'active' : ''}>📄 File</button>
+                                                <button type="button" onClick={() => setSourceType('note')} className={sourceType === 'note' ? 'active' : ''}>📝 Note</button>
                                             </div>
-                                        ))}
+                                            <div className="form-column">
+                                                <input
+                                                    type="text"
+                                                    placeholder="Source title..."
+                                                    value={newSourceTitle}
+                                                    onChange={(e) => setNewSourceTitle(e.target.value)}
+                                                    required
+                                                />
+                                                {(sourceType === 'url') && (
+                                                    <input type="url" placeholder="https://..." value={newSourceUrl} onChange={(e) => setNewSourceUrl(e.target.value)} required />
+                                                )}
+                                                {(sourceType === 'file') && (
+                                                    <div className="file-input-wrapper">
+                                                        <input
+                                                            type="file"
+                                                            onChange={(e) => setSourceFile(e.target.files[0])}
+                                                            required
+                                                            id="source-file-input"
+                                                        />
+                                                        {sourceFile && (
+                                                            <div className="file-selected">
+                                                                ✅ {sourceFile.name} ({formatFileSize(sourceFile.size)})
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                {sourceType === 'note' && (
+                                                    <textarea placeholder="Write your note..." value={noteContent} onChange={(e) => setNoteContent(e.target.value)} required />
+                                                )}
+                                                <button type="submit" disabled={loading} className="add-btn">
+                                                    {loading ? '⏳ Adding...' : '+ Add Source'}
+                                                </button>
+                                            </div>
+                                        </form>
+                                    )}
+
+                                    <div className="sources-section">
+                                        <h3>Sources ({sources.length})</h3>
+                                        <div className="sources-grid">
+                                            {sources.map((s) => (
+                                                <div key={s.id} className="source-card">
+                                                    <div className="source-header">
+                                                        <h4>{s.title}</h4>
+                                                        <button className="cite-btn" onClick={() => generateCitation(s)}>📜 Cite</button>
+                                                    </div>
+                                                    <div className="source-content">
+                                                        {s.type === 'note' ? <p>{s.content}</p> : <a href={s.content || s.url} target="_blank" rel="noreferrer">{s.content || s.url}</a>}
+                                                        {s.type === 'file' && <button onClick={(e) => handleDownload(e, s)} className="download-btn">📥 Download</button>}
+                                                    </div>
+                                                    <div className="source-meta">By {s.addedBy} • {new Date(s.addedAt).toLocaleDateString()}</div>
+                                                </div>
+                                            ))}
+                                        </div>
                                     </div>
-                                )}
-                            </div>
+                                </>
+                            )}
                         </>
                     ) : (
                         <div className="empty-state-main">
-                            <h2>Welcome to SyncScript</h2>
-                            <p>Select a vault from the sidebar or create a new one to get started.</p>
-                            <div className="feature-list">
-                                <div className="feature">
-                                    <span className="feature-icon">🗂️</span>
-                                    <span>Organize research in Knowledge Vaults</span>
-                                </div>
-                                <div className="feature">
-                                    <span className="feature-icon">👥</span>
-                                    <span>Collaborate with role-based access</span>
-                                </div>
-                                <div className="feature">
-                                    <span className="feature-icon">🔄</span>
-                                    <span>Real-time synchronization</span>
-                                </div>
-                            </div>
+                            <h2>Welcome, {user?.name}!</h2>
+                            <p>Select or create a vault to begin your research.</p>
                         </div>
                     )}
                 </main>
             </div>
-
-            {/* Footer Note */}
             <footer className="footer">
-                <p>
-                    💡 <strong>Demo Mode:</strong> Using in-memory storage and polling.
-                    Production would use PostgreSQL + WebSockets.
-                </p>
+                <p>SyncScript v2.0 • Advanced Research Collaboration</p>
             </footer>
         </div>
     );

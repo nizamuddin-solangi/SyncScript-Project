@@ -16,6 +16,10 @@ build/
 .env.development.local
 .env.test.local
 .env.production.local
+backend/.env
+
+# Prisma
+backend/prisma/migrations/
 
 # IDE and Editor files
 .vscode/
